@@ -1,0 +1,89 @@
+{
+  "name": "@boringnode/route-matcher",
+  "description": "A fast, registration-ordered route matcher",
+  "version": "0.1.0",
+  "main": "./build/index.js",
+  "types": "./build/index.d.ts",
+  "type": "module",
+  "files": [
+    "build"
+  ],
+  "exports": {
+    ".": {
+      "types": "./build/index.d.ts",
+      "import": "./build/index.js"
+    }
+  },
+  "scripts": {
+    "build": "yarn clean && tsup-node",
+    "check:package": "yarn build && publint && attw --pack --profile esm-only .",
+    "clean": "del-cli build",
+    "format": "oxfmt --check .",
+    "format:fix": "oxfmt --write .",
+    "lint": "oxlint",
+    "lint:fix": "oxlint --fix",
+    "prepublishOnly": "yarn build",
+    "release": "yarn dlx release-it",
+    "test": "node --import=@poppinss/ts-exec --enable-source-maps bin/test.ts --reporters=dot",
+    "test:coverage": "c8 yarn test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@adonisjs/tsconfig": "^2.0.0",
+    "@arethetypeswrong/cli": "^0.18.2",
+    "@japa/assert": "^4.2.0",
+    "@japa/expect-type": "^2.0.4",
+    "@japa/runner": "^5.3.0",
+    "@poppinss/matchit": "^3.2.0",
+    "@poppinss/ts-exec": "^1.4.4",
+    "@types/node": "^20.19.24",
+    "c8": "^11.0.0",
+    "del-cli": "^7.0.0",
+    "oxfmt": "^0.56.0",
+    "oxlint": "^1.71.0",
+    "publint": "^0.3.14",
+    "release-it": "^20.2.1",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3"
+  },
+  "author": "Romain Lanz <romain.lanz@pm.me>",
+  "license": "MIT",
+  "homepage": "https://github.com/boringnode/route-matcher#readme",
+  "bugs": {
+    "url": "https://github.com/boringnode/route-matcher/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/boringnode/route-matcher.git"
+  },
+  "keywords": [
+    "route",
+    "router",
+    "matcher",
+    "routing"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "tag": "latest",
+    "provenance": true
+  },
+  "release-it": {
+    "git": {
+      "commitMessage": "chore(release): ${version}",
+      "tagAnnotation": "v${version}",
+      "tagName": "v${version}"
+    },
+    "github": {
+      "release": true,
+      "releaseName": "v${version}"
+    },
+    "npm": {
+      "publish": true,
+      "skipChecks": true
+    }
+  },
+  "packageManager": "yarn@4.17.1",
+  "engines": {
+    "node": ">=20.6"
+  }
+}
