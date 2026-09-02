@@ -84,6 +84,22 @@ function compareRouteSpecificity(a: RouteToken[], b: RouteToken[]): number {
   return 0
 }
 
+function matchesSegment(token: RouteToken, segment: string | undefined): boolean {
+  if (token.type === 0) {
+    return token.val === segment
+  }
+  if (segment === '/') {
+    return token.type > 1
+  }
+  if (segment === '') {
+    return token.end === '' && (token.matcher ? token.matcher.test(segment) : true)
+  }
+  if (!segment) {
+    return token.end === ''
+  }
+  return segment.endsWith(token.end) && (token.matcher ? token.matcher.test(segment) : true)
+}
+
 function matchesRoute(tokens: RouteToken[], segments: string[]): boolean {
   if (!tokens.length) {
     return segments.length === 1 && segments[0] === '/'
@@ -99,42 +115,10 @@ function matchesRoute(tokens: RouteToken[], segments: string[]): boolean {
 
   let index = 0
   while (index < tokens.length) {
-    const token = tokens[index]
-    const segment = segments[index]
-
-    if (token.val === segment && token.type === 0) {
-      index++
-      continue
-    }
-    if (segment === '/') {
-      if (token.type > 1) {
-        index++
-        continue
-      }
+    if (!matchesSegment(tokens[index], segments[index])) {
       return false
     }
-    if (token.type === 0) {
-      return false
-    }
-    if (segment === '') {
-      if (token.end === '' && (token.matcher ? token.matcher.test(segment) : true)) {
-        index++
-        continue
-      }
-      return false
-    }
-    if (!segment) {
-      if (token.end === '') {
-        index++
-        continue
-      }
-      return false
-    }
-    if (segment.endsWith(token.end) && (token.matcher ? token.matcher.test(segment) : true)) {
-      index++
-      continue
-    }
-    return false
+    index++
   }
 
   return true
@@ -330,25 +314,40 @@ export class RouteTable<T> {
       candidateLists.push([staticRoute])
     }
 
-    if (candidateLists.length === 1) {
-      const candidates = candidateLists[0]
-      let candidateIndex = 0
-      while (candidateIndex < candidates.length) {
-        const candidate = candidates[candidateIndex++]
-        if (candidate.order >= cutoff) {
-          break
-        }
-        if (matchesIndexedRoute(candidate, segments)) {
-          return {
-            value: candidate.value,
-            params: extractRouteParams(candidate.tokens, pathname, shouldDecodeParams),
-          }
-        }
+    const candidate =
+      candidateLists.length === 1
+        ? this.#findCandidateInList(candidateLists[0], segments, cutoff)
+        : this.#findCandidateAcrossLists(candidateLists, segments, cutoff)
+    if (candidate) {
+      return {
+        value: candidate.value,
+        params: extractRouteParams(candidate.tokens, pathname, shouldDecodeParams),
       }
-
-      return registrationPrecedence && staticRoute ? { value: staticRoute.value, params: {} } : null
     }
+    return registrationPrecedence && staticRoute ? { value: staticRoute.value, params: {} } : null
+  }
 
+  #findCandidateInList(
+    candidates: IndexedRoute<T>[],
+    segments: string[],
+    cutoff: number
+  ): IndexedRoute<T> | undefined {
+    for (const candidate of candidates) {
+      if (candidate.order >= cutoff) {
+        break
+      }
+      if (matchesIndexedRoute(candidate, segments)) {
+        return candidate
+      }
+    }
+    return undefined
+  }
+
+  #findCandidateAcrossLists(
+    candidateLists: IndexedRoute<T>[][],
+    segments: string[],
+    cutoff: number
+  ): IndexedRoute<T> | undefined {
     const positions = new Uint32Array(candidateLists.length)
     while (true) {
       let selectedList = -1
@@ -362,19 +361,14 @@ export class RouteTable<T> {
       }
 
       if (!selectedRoute || selectedRoute.order >= cutoff) {
-        break
+        return undefined
       }
       positions[selectedList]++
 
       if (matchesIndexedRoute(selectedRoute, segments)) {
-        return {
-          value: selectedRoute.value,
-          params: extractRouteParams(selectedRoute.tokens, pathname, shouldDecodeParams),
-        }
+        return selectedRoute
       }
     }
-
-    return registrationPrecedence && staticRoute ? { value: staticRoute.value, params: {} } : null
   }
 
   #compareRoutes(a: IndexedRoute<T>, b: IndexedRoute<T>): number {
@@ -422,31 +416,60 @@ export class RouteTable<T> {
     }
 
     if (segmentIndex === segments.length) {
-      const terminals = node.terminals
-      if (canMatchTerminal && terminals?.length && terminals[0].order < cutoff) {
-        candidateLists.push(terminals)
-      }
-      for (const [suffix, optionalChild] of node.optionals ?? []) {
-        if (suffix === '') {
-          this.#collectCandidates(optionalChild, segments, segmentIndex, cutoff, candidateLists)
-        }
-      }
-      for (const [suffix, parameterChild] of node.parameters ?? []) {
-        if (suffix === '') {
-          this.#collectCandidates(
-            parameterChild,
-            segments,
-            segmentIndex,
-            cutoff,
-            candidateLists,
-            false
-          )
-        }
-      }
+      this.#collectTerminalCandidates(
+        node,
+        segments,
+        segmentIndex,
+        cutoff,
+        candidateLists,
+        canMatchTerminal
+      )
       return
     }
 
     const segment = segments[segmentIndex]
+    this.#collectSegmentCandidates(node, segments, segmentIndex, segment, cutoff, candidateLists)
+  }
+
+  #collectTerminalCandidates(
+    node: RouteNode<T>,
+    segments: string[],
+    segmentIndex: number,
+    cutoff: number,
+    candidateLists: IndexedRoute<T>[][],
+    canMatchTerminal: boolean
+  ): void {
+    const terminals = node.terminals
+    if (canMatchTerminal && terminals?.length && terminals[0].order < cutoff) {
+      candidateLists.push(terminals)
+    }
+    for (const [suffix, optionalChild] of node.optionals ?? []) {
+      if (suffix === '') {
+        this.#collectCandidates(optionalChild, segments, segmentIndex, cutoff, candidateLists)
+      }
+    }
+    for (const [suffix, parameterChild] of node.parameters ?? []) {
+      if (suffix === '') {
+        this.#collectCandidates(
+          parameterChild,
+          segments,
+          segmentIndex,
+          cutoff,
+          candidateLists,
+          false
+        )
+      }
+    }
+  }
+
+  #collectSegmentCandidates(
+    node: RouteNode<T>,
+    segments: string[],
+    segmentIndex: number,
+    segment: string,
+    cutoff: number,
+    candidateLists: IndexedRoute<T>[][]
+  ): void {
     const literalChild = node.literals?.get(segment)
     if (literalChild) {
       this.#collectCandidates(literalChild, segments, segmentIndex + 1, cutoff, candidateLists)
