@@ -51,9 +51,8 @@ function getStaticRouteKey(tokens: RouteToken[]): string | null {
     : `segments:${tokens.map((token) => token.val).join('/')}`
 }
 
-function getStaticRequestKey(pathname: string): string {
-  pathname = stripRouteSeparators(pathname)
-  return pathname === '/' ? 'root' : `segments:${pathname}`
+function getStaticRequestKey(normalizedPathname: string): string {
+  return normalizedPathname === '/' ? 'root' : `segments:${normalizedPathname}`
 }
 
 function getOrCreateChild<T>(children: Map<string, RouteNode<T>>, key: string): RouteNode<T> {
@@ -146,12 +145,11 @@ function matchesIndexedRoute<T>(route: IndexedRoute<T>, segments: string[]): boo
   return true
 }
 
-export function extractRouteParams(
+function extractRouteParamsFromSegments(
   tokens: RouteToken[],
-  pathname: string,
-  shouldDecodeParams: boolean = false
+  segments: string[],
+  shouldDecodeParams: boolean
 ): RouteParams {
-  const segments = splitRoutePath(pathname)
   const params: RouteParams = {}
   let index = 0
 
@@ -196,6 +194,14 @@ export function extractRouteParams(
   return params
 }
 
+export function extractRouteParams(
+  tokens: RouteToken[],
+  pathname: string,
+  shouldDecodeParams: boolean = false
+): RouteParams {
+  return extractRouteParamsFromSegments(tokens, splitRoutePath(pathname), shouldDecodeParams)
+}
+
 /** Matches a transient list of tokenized routes without building an index. */
 export function matchRouteTokens(
   pathname: string,
@@ -205,7 +211,7 @@ export function matchRouteTokens(
   const segments = splitRoutePath(pathname)
   for (const tokens of routes) {
     if (matchesRoute(tokens, segments)) {
-      return extractRouteParams(tokens, pathname, shouldDecodeParams)
+      return extractRouteParamsFromSegments(tokens, segments, shouldDecodeParams)
     }
   }
   return null
@@ -289,7 +295,8 @@ export class RouteTable<T> {
   }
 
   match(pathname: string, shouldDecodeParams: boolean = false): RouteMatch<T> | null {
-    const staticRoute = this.#staticRoutes.get(getStaticRequestKey(pathname))
+    const normalizedPathname = stripRouteSeparators(pathname)
+    const staticRoute = this.#staticRoutes.get(getStaticRequestKey(normalizedPathname))
     const registrationPrecedence = this.#precedence === 'registration'
     const cutoff = registrationPrecedence
       ? (staticRoute?.order ?? Number.POSITIVE_INFINITY)
@@ -304,7 +311,7 @@ export class RouteTable<T> {
       return { value: staticRoute.value, params: {} }
     }
 
-    const segments = splitRoutePath(pathname)
+    const segments = normalizedPathname === '/' ? ['/'] : normalizedPathname.split('/')
     const candidateLists: IndexedRoute<T>[][] = []
     if (firstUnindexedRoute && (!registrationPrecedence || firstUnindexedRoute.order < cutoff)) {
       candidateLists.push(this.#unindexedRoutes)
@@ -321,7 +328,7 @@ export class RouteTable<T> {
     if (candidate) {
       return {
         value: candidate.value,
-        params: extractRouteParams(candidate.tokens, pathname, shouldDecodeParams),
+        params: extractRouteParamsFromSegments(candidate.tokens, segments, shouldDecodeParams),
       }
     }
     return registrationPrecedence && staticRoute ? { value: staticRoute.value, params: {} } : null
