@@ -1,63 +1,144 @@
 # @boringnode/route-matcher
 
-A small, zero-dependency route parser and indexed route table for Node.js.
+<div align="center">
 
-```sh
-yarn add @boringnode/route-matcher
+[![typescript-image]][typescript-url]
+[![gh-workflow-image]][gh-workflow-url]
+[![npm-image]][npm-url]
+[![npm-download-image]][npm-download-url]
+[![license-image]][license-url]
+
+</div>
+
+A small, zero-dependency route parser and indexed route table for Node.js. It supports static
+segments, parameters, wildcards, custom matchers, and typed route values.
+
+## Installation
+
+```bash
+npm install @boringnode/route-matcher
 ```
 
-## Parse a route
+## Features
 
-```ts
-import { parseRoute } from '@boringnode/route-matcher'
+- **Route patterns**: Static, required, optional, suffixed, and wildcard segments
+- **Indexed matching**: Discards impossible candidates without changing route precedence
+- **Configurable precedence**: Match by registration order or route specificity
+- **Parameter constraints**: Validate parameters with regular expressions
+- **Parameter casting**: Transform matched parameters into numbers or other values
+- **Type-safe values**: Associate any typed value with a route
+- **Zero dependencies**: No runtime dependencies
 
-const tokens = parseRoute('/users/:id.json', {
-  id: { match: /^\d+$/, cast: Number },
-})
-```
-
-Patterns support static segments, required parameters (`:id`), optional parameters (`:id?`),
-parameter suffixes (`:id.json`), and trailing wildcards (`*`). A matcher may constrain a parameter
-with `match` and transform its extracted value with `cast`.
-
-## Match routes
+## Quick start
 
 ```ts
 import { parseRoute, RouteTable } from '@boringnode/route-matcher'
 
-type Route = { name: string }
+type Route = {
+  name: string
+}
 
 const routes = new RouteTable<Route>()
 
-routes.add(parseRoute('/:slug'), { name: 'page' })
+routes.add(
+  parseRoute('/users/:id', {
+    id: { match: /^\d+$/, cast: Number },
+  }),
+  { name: 'users.show' }
+)
+
 routes.add(parseRoute('/about'), { name: 'about' })
 
-routes.match('/about')
-// { value: { name: 'page' }, params: { slug: 'about' } }
+routes.match('/users/42')
+// { value: { name: 'users.show' }, params: { id: 42 } }
 ```
 
-By default, the first registered matching route wins. Route shape does not change precedence: an
-earlier parameter or wildcard route can win over a later static route. The table uses static lookup
-and a private segment index to discard impossible candidates while preserving registration order.
+`RouteTable` keeps the generic value type, so `match().value` has the same type as the values passed
+to `add()`.
 
-### Specificity precedence
+## Route patterns
 
-Applications that need the most specific match can opt in when creating the table:
+| Pattern             | Matches                   | Parameters                        |
+| ------------------- | ------------------------- | --------------------------------- |
+| `/users`            | `/users`                  | `{}`                              |
+| `/users/:id`        | `/users/42`               | `{ id: '42' }`                    |
+| `/archive/:year?`   | `/archive`, `/archive/26` | `{}` or `{ year: '26' }`          |
+| `/files/:name.json` | `/files/report.json`      | `{ name: 'report' }`              |
+| `/files/*`          | `/files/images/logo.png`  | `{ '*': ['images', 'logo.png'] }` |
+
+Wildcards must be the last segment of a pattern.
+
+### Matchers and casts
+
+Pass parameter matchers as the second argument to `parseRoute`. A matcher may constrain the value
+with `match` and transform it with `cast`.
 
 ```ts
-const routes = new RouteTable<Route>({ precedence: 'specificity' })
+const userRoute = parseRoute('/users/:id', {
+  id: {
+    match: /^\d+$/,
+    cast: Number,
+  },
+})
+```
+
+If a matcher rejects a parameter, the table continues with the next matching route.
+
+## Route precedence
+
+By default, the first registered route that matches the pathname wins. Route shape does not change
+precedence.
+
+```ts
+const routes = new RouteTable<string>()
+
+routes.add(parseRoute('/:slug'), 'page')
+routes.add(parseRoute('/about'), 'about')
+
+routes.match('/about')
+// { value: 'page', params: { slug: 'about' } }
+```
+
+Use specificity precedence when static routes should win over dynamic routes regardless of
+registration order.
+
+```ts
+const routes = new RouteTable<string>({ precedence: 'specificity' })
+
+routes.add(parseRoute('/:slug'), 'page')
+routes.add(parseRoute('/about'), 'about')
+
+routes.match('/about')
+// { value: 'about', params: {} }
 ```
 
 Specificity is compared segment by segment from left to right. Static segments rank above required
-parameters, followed by optional parameters and wildcards. When common segments have equal
-specificity, the longer pattern wins. Equally specific patterns retain registration order.
+parameters, followed by optional parameters and wildcards. Longer patterns win when their shared
+segments have equal specificity. Registration order breaks remaining ties.
 
-`match(pathname, true)` decodes parameters with `decodeURIComponent`. Decoding is off by default.
-Invalid percent-encoded values are kept unchanged, and `cast` functions run after decoding.
-Wildcards are returned under `'*'` as an array of path segments. This package matches path strings
-as provided; it does not remove query strings.
+## Parameter decoding
 
-For a short-lived list that does not need an index, use `matchRouteTokens`:
+Parameter decoding is disabled by default. Pass `true` to `match` to decode parameters with
+`decodeURIComponent` before applying casts.
+
+```ts
+const routes = new RouteTable<string>()
+routes.add(parseRoute('/files/:name'), 'file')
+
+routes.match('/files/hello%20world', true)
+// { value: 'file', params: { name: 'hello world' } }
+```
+
+Invalid percent-encoded values remain unchanged. Wildcard segments are decoded one at a time.
+
+> [!NOTE]
+> The package matches the pathname exactly as provided. It does not remove query strings. Pass a
+> URL's `pathname` when query parameters should not be part of the match.
+
+## Matching without a route table
+
+Use `matchRouteTokens` for a short-lived route list that does not need an index. Routes are checked
+in array order.
 
 ```ts
 import { matchRouteTokens, parseRoute } from '@boringnode/route-matcher'
@@ -66,8 +147,19 @@ const params = matchRouteTokens('/posts/42', [parseRoute('/posts/:id')])
 // { id: '42' }
 ```
 
-`extractRouteParams` is also exported for consumers that keep their own route index.
+The package also exports `extractRouteParams` for consumers that maintain their own route index.
 
 ## License
 
 [MIT](./LICENSE.md)
+
+[gh-workflow-image]: https://img.shields.io/github/actions/workflow/status/boringnode/route-matcher/checks.yml?branch=main&style=for-the-badge
+[gh-workflow-url]: https://github.com/boringnode/route-matcher/actions/workflows/checks.yml
+[npm-image]: https://img.shields.io/npm/v/@boringnode/route-matcher.svg?style=for-the-badge&logo=npm
+[npm-url]: https://www.npmjs.com/package/@boringnode/route-matcher
+[npm-download-image]: https://img.shields.io/npm/dm/@boringnode/route-matcher?style=for-the-badge
+[npm-download-url]: https://www.npmjs.com/package/@boringnode/route-matcher
+[typescript-image]: https://img.shields.io/badge/Typescript-294E80.svg?style=for-the-badge&logo=typescript
+[typescript-url]: https://www.typescriptlang.org
+[license-image]: https://img.shields.io/npm/l/@boringnode/route-matcher?color=blueviolet&style=for-the-badge
+[license-url]: LICENSE.md
