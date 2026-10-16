@@ -72,6 +72,8 @@ test.group('Route table', () => {
     table.add(parseRoute('/:value/foo', { value: { match: matcher } }), 'dynamic')
     table.add(parseRoute('/users/bar'), 'static')
 
+    assert.strictEqual(table.prepare().prepare(), table)
+    assert.equal(matcherCalls, 0)
     assert.deepEqual(table.match('/users/bar'), { value: 'static', params: {} })
     assert.equal(matcherCalls, 1)
   })
@@ -188,6 +190,68 @@ test.group('Route table', () => {
 
     expectTypeOf(table.match('/')?.value.name).toEqualTypeOf<string | undefined>()
   })
+
+  test('preserves precedence and casts when routes are added after preparation', ({ assert }) => {
+    for (const precedence of ['registration', 'specificity'] as const) {
+      const table = new RouteTable<string>({ precedence })
+      const casts: string[] = []
+      table.add(
+        parseRoute('/users/:id', {
+          id: {
+            match: /^\d+$/,
+            cast: (value) => {
+              casts.push(value)
+              return Number(value)
+            },
+          },
+        }),
+        'user'
+      )
+      table.add(parseRoute('/users/me'), 'profile')
+      table.prepare()
+      assert.deepEqual(casts, [])
+      assert.deepEqual(table.match('/users/me'), { value: 'profile', params: {} })
+      table.add(parseRoute('/users/42'), 'answer')
+      table.prepare()
+      assert.deepEqual(casts, [])
+      assert.deepEqual(
+        table.match('/users/42'),
+        precedence === 'registration'
+          ? { value: 'user', params: { id: 42 } }
+          : { value: 'answer', params: {} }
+      )
+      assert.deepEqual(casts, precedence === 'registration' ? ['42'] : [])
+    }
+  })
+
+  test('preserves hand-built static token matching and extraction after preparation', ({
+    assert,
+  }) => {
+    for (const precedence of ['registration', 'specificity'] as const) {
+      const table = new RouteTable<string>({ precedence })
+      table.add(
+        [
+          { old: '/a/*', type: 0, val: 'a', end: '' },
+          { old: '/a/*', type: 0, val: '*', end: '' },
+        ],
+        'star'
+      )
+      table.add([{ old: '/a/b', type: 0, val: 'a/b', end: '' }], 'joined')
+      table.add(parseRoute('/:first/:second'), 'dynamic')
+      table.prepare().prepare()
+
+      assert.deepEqual(table.match('/a/*'), {
+        value: 'star',
+        params: precedence === 'registration' ? {} : { '*': ['*'] },
+      })
+      assert.deepEqual(
+        table.match('/a/b'),
+        precedence === 'registration'
+          ? { value: 'joined', params: {} }
+          : { value: 'dynamic', params: { first: 'a', second: 'b' } }
+      )
+    }
+  })
 })
 
 test.group('Route table | specificity precedence', () => {
@@ -224,8 +288,12 @@ test.group('Route table | specificity precedence', () => {
   test('prefers a longer pattern when common segments have equal specificity', ({ assert }) => {
     const table = new RouteTable<string>({ precedence: 'specificity' })
     table.add(parseRoute('/chat'), 'short')
+    table.prepare()
+    assert.deepEqual(table.match('/chat'), { value: 'short', params: {} })
     table.add(parseRoute('/chat/:room?'), 'long')
 
+    assert.deepEqual(table.match('/chat'), { value: 'long', params: {} })
+    table.prepare()
     assert.deepEqual(table.match('/chat'), { value: 'long', params: {} })
   })
 

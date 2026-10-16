@@ -15,19 +15,30 @@ import type {
 
 type IndexedRoute<T> = {
   additionalMatcherChecks?: { index: number; matcher: RegExp }[]
+  /**
+   * Static routes only. True when another route could win this pathname or
+   * run a matcher before it, so lookups take the full search. Computed by the
+   * first lookup or prepare(), and cleared when a later route may change the answer.
+   */
+  isShadowed?: boolean
   isStructurallyMatched?: boolean
   matcher?: RegExp
   matcherSegmentIndex?: number
   order: number
+  parameterIndexes: number[]
+  specificityRank: string
   tokens: RouteToken[]
   value: T
 }
 
+/** A parameter edge, keyed by the suffix its segments must end with. */
+type RouteBranch<T> = { node: RouteNode<T>; suffix: string }
+
 type RouteNode<T> = {
   literals?: Map<string, RouteNode<T>>
   minimumOrder: number
-  optionals?: Map<string, RouteNode<T>>
-  parameters?: Map<string, RouteNode<T>>
+  optionals?: RouteBranch<T>[]
+  parameters?: RouteBranch<T>[]
   terminals?: IndexedRoute<T>[]
   wildcards?: IndexedRoute<T>[]
 }
@@ -41,18 +52,62 @@ function splitRoutePath(pathname: string): string[] {
   return pathname === '/' ? ['/'] : pathname.split('/')
 }
 
-function getStaticRouteKey(tokens: RouteToken[]): string | null {
-  if (!tokens.length || tokens.some((token) => token.type !== 0)) {
-    return null
-  }
-
-  return tokens.length === 1 && tokens[0].val === '/'
-    ? 'root'
-    : `segments:${tokens.map((token) => token.val).join('/')}`
+function isStaticRoute(tokens: RouteToken[]): boolean {
+  return tokens.length > 0 && tokens.every((token) => token.type === 0)
 }
 
-function getStaticRequestKey(normalizedPathname: string): string {
-  return normalizedPathname === '/' ? 'root' : `segments:${normalizedPathname}`
+function isRootRoute(tokens: RouteToken[]): boolean {
+  return tokens.length === 1 && tokens[0].type === 0 && tokens[0].val === '/'
+}
+
+/**
+ * Static routes are keyed by the normalized pathname they answer, so lookups
+ * hash the request without building a key. Only the root route answers "/":
+ * other tokens joining to "/" are unreachable and return null.
+ */
+function getStaticRouteKey(tokens: RouteToken[]): string | null {
+  if (isRootRoute(tokens)) {
+    return '/'
+  }
+  const key = tokens.map((token) => token.val).join('/')
+  return key === '/' ? null : key
+}
+
+/**
+ * Like `matchesRoute`, but answers whether a lookup could match the route or
+ * run one of its matchers, without running them.
+ */
+function mayMatchOrRunMatcher(tokens: RouteToken[], segments: string[]): boolean {
+  if (!tokens.length) {
+    return segments.length === 1 && segments[0] === '/'
+  }
+
+  if (
+    tokens.length !== segments.length &&
+    !(tokens.length < segments.length && tokens[tokens.length - 1].type === 2) &&
+    !(tokens.length > segments.length && tokens[tokens.length - 1].type === 3)
+  ) {
+    return false
+  }
+
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index]
+    const segment = segments[index]
+    if (token.type === 0) {
+      if (token.val !== segment) return false
+    } else if (segment === '/') {
+      if (token.type <= 1) return false
+    } else if (segment === '') {
+      if (token.end !== '') return false
+      if (token.matcher) return true
+    } else if (!segment) {
+      if (token.end !== '') return false
+    } else {
+      if (!segment.endsWith(token.end)) return false
+      if (token.matcher) return true
+    }
+  }
+  return true
 }
 
 function getOrCreateChild<T>(children: Map<string, RouteNode<T>>, key: string): RouteNode<T> {
@@ -64,6 +119,15 @@ function getOrCreateChild<T>(children: Map<string, RouteNode<T>>, key: string): 
   return child
 }
 
+function getOrCreateBranch<T>(branches: RouteBranch<T>[], suffix: string): RouteNode<T> {
+  for (const branch of branches) {
+    if (branch.suffix === suffix) return branch.node
+  }
+  const node = createNode<T>()
+  branches.push({ node, suffix })
+  return node
+}
+
 function getTokenSpecificity(type: RouteTokenType): number {
   if (type === 0) return 3
   if (type === 1) return 2
@@ -71,16 +135,17 @@ function getTokenSpecificity(type: RouteTokenType): number {
   return 0
 }
 
-function compareRouteSpecificity(a: RouteToken[], b: RouteToken[]): number {
-  const length = Math.max(a.length, b.length)
-  for (let index = 0; index < length; index++) {
-    const aSpecificity = a[index] ? getTokenSpecificity(a[index].type) : -1
-    const bSpecificity = b[index] ? getTokenSpecificity(b[index].type) : -1
-    if (aSpecificity !== bSpecificity) {
-      return bSpecificity - aSpecificity
-    }
+/**
+ * Encodes specificity so that comparing two ranks as strings compares routes
+ * segment by segment: "0" static, "1" required, "2" optional, "3" wildcard,
+ * and "4" for a missing token. Trailing "4"s are implied by the "5" ending.
+ */
+function getSpecificityRank(tokens: RouteToken[]): string {
+  let rank = ''
+  for (let index = 0; index < tokens.length; index++) {
+    rank += tokens[index] ? 3 - getTokenSpecificity(tokens[index].type) : 4
   }
-  return 0
+  return `${rank.replace(/4+$/, '')}5`
 }
 
 function matchesSegment(token: RouteToken, segment: string | undefined): boolean {
@@ -145,50 +210,64 @@ function matchesIndexedRoute<T>(route: IndexedRoute<T>, segments: string[]): boo
   return true
 }
 
+const NO_PARAMETER_INDEXES: number[] = []
+
+/** Indexes of the tokens that produce parameters, computed once per route. */
+function getParameterIndexes(tokens: RouteToken[]): number[] {
+  let indexes: number[] | undefined
+  for (let index = 0; index < tokens.length; index++) {
+    if (tokens[index].type !== 0 || tokens[index].val === '*') {
+      ;(indexes ||= []).push(index)
+    }
+  }
+  return indexes ?? NO_PARAMETER_INDEXES
+}
+
+function decodeParam(value: string): string {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return value
+  }
+}
+
+/**
+ * Only tokens that can produce parameters are visited, including hand-built
+ * static tokens named "*". A suffix is removed at its first occurrence.
+ */
 function extractRouteParamsFromSegments(
   tokens: RouteToken[],
+  parameterIndexes: number[],
   segments: string[],
   shouldDecodeParams: boolean
 ): RouteParams {
   const params: RouteParams = {}
-  let index = 0
 
-  while (index < tokens.length) {
+  for (let position = 0; position < parameterIndexes.length; position++) {
+    const index = parameterIndexes[position]
     const token = tokens[index]
     const segment = segments[index]
 
     if (segment === '/') {
-      index++
       continue
     }
 
     if (token.val === '*') {
-      params[token.val] = segments.slice(index).map((value) => {
-        if (!shouldDecodeParams) {
-          return value
-        }
-        try {
-          return decodeURIComponent(value)
-        } catch {
-          return value
-        }
-      })
+      params[token.val] = segments
+        .slice(index)
+        .map((value) => (shouldDecodeParams ? decodeParam(value) : value))
       break
     }
 
-    if (segment === undefined || token.type === 0) {
-      index++
+    if (segment === undefined) {
       continue
     }
 
-    let value = segment.replace(token.end, '')
+    let value = token.end === '' ? segment : segment.replace(token.end, '')
     if (shouldDecodeParams) {
-      try {
-        value = decodeURIComponent(value)
-      } catch {}
+      value = decodeParam(value)
     }
     params[token.val] = token.cast ? token.cast(value) : value
-    index++
   }
 
   return params
@@ -199,7 +278,12 @@ export function extractRouteParams(
   pathname: string,
   shouldDecodeParams: boolean = false
 ): RouteParams {
-  return extractRouteParamsFromSegments(tokens, splitRoutePath(pathname), shouldDecodeParams)
+  return extractRouteParamsFromSegments(
+    tokens,
+    getParameterIndexes(tokens),
+    splitRoutePath(pathname),
+    shouldDecodeParams
+  )
 }
 
 /** Matches a transient list of tokenized routes without building an index. */
@@ -211,7 +295,12 @@ export function matchRouteTokens(
   const segments = splitRoutePath(pathname)
   for (const tokens of routes) {
     if (matchesRoute(tokens, segments)) {
-      return extractRouteParamsFromSegments(tokens, segments, shouldDecodeParams)
+      return extractRouteParamsFromSegments(
+        tokens,
+        getParameterIndexes(tokens),
+        segments,
+        shouldDecodeParams
+      )
     }
   }
   return null
@@ -223,6 +312,11 @@ export class RouteTable<T> {
   #precedence: RoutePrecedence
   #root = createNode<T>()
   #staticRoutes = new Map<string, IndexedRoute<T>>()
+  /**
+   * One bit per (key length, last character) pair seen among static keys, so
+   * most dynamic pathnames skip hashing into `#staticRoutes`.
+   */
+  #staticKeyFilter = new Uint32Array(64)
   #unindexedRoutes: IndexedRoute<T>[] = []
 
   constructor(options: RouteTableOptions = {}) {
@@ -230,16 +324,98 @@ export class RouteTable<T> {
   }
 
   add(tokens: RouteToken[], value: T): this {
-    const indexedRoute: IndexedRoute<T> = { order: this.#nextOrder++, tokens, value }
-    const staticKey = getStaticRouteKey(tokens)
+    const indexedRoute: IndexedRoute<T> = {
+      order: this.#nextOrder++,
+      parameterIndexes: getParameterIndexes(tokens),
+      specificityRank: this.#precedence === 'specificity' ? getSpecificityRank(tokens) : '',
+      tokens,
+      value,
+    }
 
-    if (staticKey !== null) {
-      if (!this.#staticRoutes.has(staticKey)) {
+    if (isStaticRoute(tokens)) {
+      const staticKey = getStaticRouteKey(tokens)
+      if (staticKey !== null && !this.#staticRoutes.has(staticKey)) {
+        // Hand-built tokens holding "/" or "*" keep the full search, as before.
+        if (
+          (!isRootRoute(tokens) && tokens.some((token) => token.val.includes('/'))) ||
+          indexedRoute.parameterIndexes.length > 0
+        ) {
+          indexedRoute.isShadowed = true
+        }
         this.#staticRoutes.set(staticKey, indexedRoute)
+        this.#staticKeyFilter[staticKey.length & 63] |=
+          1 << (staticKey.charCodeAt(staticKey.length - 1) & 31)
       }
       return this
     }
 
+    this.#indexDynamicRoute(indexedRoute)
+    this.#shadowStaticRoutes(tokens)
+    return this
+  }
+
+  match(pathname: string, shouldDecodeParams: boolean = false): RouteMatch<T> | null {
+    const normalizedPathname = stripRouteSeparators(pathname)
+    const length = normalizedPathname.length
+    const staticRoute =
+      this.#staticKeyFilter[length & 63] & (1 << (normalizedPathname.charCodeAt(length - 1) & 31))
+        ? this.#staticRoutes.get(normalizedPathname)
+        : undefined
+    if (staticRoute) {
+      staticRoute.isShadowed ??= this.#isStaticRouteShadowed(staticRoute, normalizedPathname)
+      if (!staticRoute.isShadowed) {
+        return { value: staticRoute.value, params: {} }
+      }
+    }
+
+    const registrationPrecedence = this.#precedence === 'registration'
+    const cutoff = registrationPrecedence
+      ? (staticRoute?.order ?? Number.POSITIVE_INFINITY)
+      : Number.POSITIVE_INFINITY
+    const firstUnindexedRoute = this.#unindexedRoutes[0]
+
+    const segments = normalizedPathname === '/' ? ['/'] : normalizedPathname.split('/')
+    const candidateLists: IndexedRoute<T>[][] = []
+    if (firstUnindexedRoute && (!registrationPrecedence || firstUnindexedRoute.order < cutoff)) {
+      candidateLists.push(this.#unindexedRoutes)
+    }
+    this.#collectCandidates(this.#root, segments, 0, cutoff, candidateLists)
+    if (!registrationPrecedence && staticRoute) {
+      candidateLists.push([staticRoute])
+    }
+
+    const candidate =
+      candidateLists.length === 1
+        ? this.#findCandidateInList(candidateLists[0], segments, cutoff)
+        : this.#findCandidateAcrossLists(candidateLists, segments, cutoff)
+    if (candidate) {
+      return {
+        value: candidate.value,
+        params: extractRouteParamsFromSegments(
+          candidate.tokens,
+          candidate.parameterIndexes,
+          segments,
+          shouldDecodeParams
+        ),
+      }
+    }
+    return registrationPrecedence && staticRoute ? { value: staticRoute.value, params: {} } : null
+  }
+
+  /**
+   * Prepares static lookup shortcuts after registration, without running matchers
+   * or casts. Optional: match() prepares them lazily otherwise. Later additions
+   * remain supported; invalidated shortcuts are prepared by match() or prepare().
+   */
+  prepare(): this {
+    for (const [staticKey, staticRoute] of this.#staticRoutes) {
+      staticRoute.isShadowed ??= this.#isStaticRouteShadowed(staticRoute, staticKey)
+    }
+    return this
+  }
+
+  #indexDynamicRoute(indexedRoute: IndexedRoute<T>): void {
+    const tokens = indexedRoute.tokens
     const hasStatefulMatcher = tokens.some((token, index) => {
       const matcher = token.matcher
       const isStateful =
@@ -265,7 +441,7 @@ export class RouteTable<T> {
 
     if (!tokens.length || hasStatefulMatcher) {
       this.#insertCandidate(this.#unindexedRoutes, indexedRoute)
-      return this
+      return
     }
 
     let node = this.#root
@@ -275,15 +451,15 @@ export class RouteTable<T> {
         node.literals ||= new Map()
         node = getOrCreateChild(node.literals, token.val)
       } else if (token.type === 1) {
-        node.parameters ||= new Map()
-        node = getOrCreateChild(node.parameters, token.end)
+        node.parameters ||= []
+        node = getOrCreateBranch(node.parameters, token.end)
       } else if (token.type === 3) {
-        node.optionals ||= new Map()
-        node = getOrCreateChild(node.optionals, token.end)
+        node.optionals ||= []
+        node = getOrCreateBranch(node.optionals, token.end)
       } else {
         node.wildcards ||= []
         this.#insertCandidate(node.wildcards, indexedRoute)
-        return this
+        return
       }
       node.minimumOrder = Math.min(node.minimumOrder, indexedRoute.order)
     }
@@ -291,47 +467,63 @@ export class RouteTable<T> {
     node.terminals ||= []
     indexedRoute.isStructurallyMatched = true
     this.#insertCandidate(node.terminals, indexedRoute)
-    return this
   }
 
-  match(pathname: string, shouldDecodeParams: boolean = false): RouteMatch<T> | null {
-    const normalizedPathname = stripRouteSeparators(pathname)
-    const staticRoute = this.#staticRoutes.get(getStaticRequestKey(normalizedPathname))
-    const registrationPrecedence = this.#precedence === 'registration'
-    const cutoff = registrationPrecedence
-      ? (staticRoute?.order ?? Number.POSITIVE_INFINITY)
-      : Number.POSITIVE_INFINITY
-    const firstUnindexedRoute = this.#unindexedRoutes[0]
-    if (
-      registrationPrecedence &&
-      staticRoute &&
-      this.#root.minimumOrder >= cutoff &&
-      (!firstUnindexedRoute || firstUnindexedRoute.order >= cutoff)
-    ) {
-      return { value: staticRoute.value, params: {} }
-    }
-
-    const segments = normalizedPathname === '/' ? ['/'] : normalizedPathname.split('/')
-    const candidateLists: IndexedRoute<T>[][] = []
-    if (firstUnindexedRoute && (!registrationPrecedence || firstUnindexedRoute.order < cutoff)) {
-      candidateLists.push(this.#unindexedRoutes)
-    }
+  /**
+   * Whether a lookup for this static route's pathname would evaluate another
+   * route first: one that ranks before it and could match or run a matcher.
+   */
+  #isStaticRouteShadowed(staticRoute: IndexedRoute<T>, staticKey: string): boolean {
+    const segments = staticKey === '/' ? ['/'] : staticKey.split('/')
+    const cutoff =
+      this.#precedence === 'registration' ? staticRoute.order : Number.POSITIVE_INFINITY
+    const candidateLists: IndexedRoute<T>[][] = [this.#unindexedRoutes]
     this.#collectCandidates(this.#root, segments, 0, cutoff, candidateLists)
-    if (!registrationPrecedence && staticRoute) {
-      candidateLists.push([staticRoute])
+    return candidateLists.some((candidates) =>
+      candidates.some((candidate) => this.#shadowsStaticRoute(candidate, staticRoute, segments))
+    )
+  }
+
+  #shadowsStaticRoute(
+    candidate: IndexedRoute<T>,
+    staticRoute: IndexedRoute<T>,
+    segments: string[]
+  ): boolean {
+    return (
+      this.#compareRoutes(candidate, staticRoute) < 0 &&
+      (candidate.isStructurallyMatched === true || mayMatchOrRunMatcher(candidate.tokens, segments))
+    )
+  }
+
+  /**
+   * Under specificity, a later dynamic route can outrank an existing static
+   * route only by repeating all of its segments and ending with an optional
+   * parameter, so only static routes named by its static prefixes are reset
+   * for the next lookup to recompute. Static segments containing "/" reset all.
+   */
+  #shadowStaticRoutes(tokens: RouteToken[]): void {
+    if (this.#precedence === 'registration' || !this.#staticRoutes.size) {
+      return
     }
 
-    const candidate =
-      candidateLists.length === 1
-        ? this.#findCandidateInList(candidateLists[0], segments, cutoff)
-        : this.#findCandidateAcrossLists(candidateLists, segments, cutoff)
-    if (candidate) {
-      return {
-        value: candidate.value,
-        params: extractRouteParamsFromSegments(candidate.tokens, segments, shouldDecodeParams),
+    if (tokens.some((token) => token.type === 0 && token.val.includes('/'))) {
+      for (const staticRoute of this.#staticRoutes.values()) {
+        if (staticRoute.isShadowed === false) staticRoute.isShadowed = undefined
+      }
+      return
+    }
+    if (tokens[tokens.length - 1]?.type !== 3) {
+      return
+    }
+
+    let staticKey = ''
+    for (let index = 0; index < tokens.length && tokens[index].type === 0; index++) {
+      staticKey = index === 0 ? tokens[0].val : `${staticKey}/${tokens[index].val}`
+      const staticRoute = this.#staticRoutes.get(staticKey)
+      if (staticRoute?.isShadowed === false) {
+        staticRoute.isShadowed = undefined
       }
     }
-    return registrationPrecedence && staticRoute ? { value: staticRoute.value, params: {} } : null
   }
 
   #findCandidateInList(
@@ -379,9 +571,8 @@ export class RouteTable<T> {
   }
 
   #compareRoutes(a: IndexedRoute<T>, b: IndexedRoute<T>): number {
-    if (this.#precedence === 'specificity') {
-      const specificity = compareRouteSpecificity(a.tokens, b.tokens)
-      if (specificity !== 0) return specificity
+    if (a.specificityRank !== b.specificityRank) {
+      return a.specificityRank < b.specificityRank ? -1 : 1
     }
     return a.order - b.order
   }
@@ -450,21 +641,33 @@ export class RouteTable<T> {
     if (canMatchTerminal && terminals?.length && terminals[0].order < cutoff) {
       candidateLists.push(terminals)
     }
-    for (const [suffix, optionalChild] of node.optionals ?? []) {
-      if (suffix === '') {
-        this.#collectCandidates(optionalChild, segments, segmentIndex, cutoff, candidateLists)
+    const optionals = node.optionals
+    if (optionals) {
+      for (let index = 0; index < optionals.length; index++) {
+        if (optionals[index].suffix === '') {
+          this.#collectCandidates(
+            optionals[index].node,
+            segments,
+            segmentIndex,
+            cutoff,
+            candidateLists
+          )
+        }
       }
     }
-    for (const [suffix, parameterChild] of node.parameters ?? []) {
-      if (suffix === '') {
-        this.#collectCandidates(
-          parameterChild,
-          segments,
-          segmentIndex,
-          cutoff,
-          candidateLists,
-          false
-        )
+    const parameters = node.parameters
+    if (parameters) {
+      for (let index = 0; index < parameters.length; index++) {
+        if (parameters[index].suffix === '') {
+          this.#collectCandidates(
+            parameters[index].node,
+            segments,
+            segmentIndex,
+            cutoff,
+            candidateLists,
+            false
+          )
+        }
       }
     }
   }
@@ -481,11 +684,12 @@ export class RouteTable<T> {
     if (literalChild) {
       this.#collectCandidates(literalChild, segments, segmentIndex + 1, cutoff, candidateLists)
     }
-    if (segment !== '/') {
-      for (const [suffix, parameterChild] of node.parameters ?? []) {
-        if (segment.endsWith(suffix)) {
+    const parameters = node.parameters
+    if (parameters && segment !== '/') {
+      for (let index = 0; index < parameters.length; index++) {
+        if (segment.endsWith(parameters[index].suffix)) {
           this.#collectCandidates(
-            parameterChild,
+            parameters[index].node,
             segments,
             segmentIndex + 1,
             cutoff,
@@ -494,9 +698,18 @@ export class RouteTable<T> {
         }
       }
     }
-    for (const [suffix, optionalChild] of node.optionals ?? []) {
-      if (segment === '/' || segment.endsWith(suffix)) {
-        this.#collectCandidates(optionalChild, segments, segmentIndex + 1, cutoff, candidateLists)
+    const optionals = node.optionals
+    if (optionals) {
+      for (let index = 0; index < optionals.length; index++) {
+        if (segment === '/' || segment.endsWith(optionals[index].suffix)) {
+          this.#collectCandidates(
+            optionals[index].node,
+            segments,
+            segmentIndex + 1,
+            cutoff,
+            candidateLists
+          )
+        }
       }
     }
   }

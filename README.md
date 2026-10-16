@@ -56,6 +56,9 @@ routes.match('/users/42')
 `RouteTable` keeps the generic value type, so `match().value` has the same type as the values passed
 to `add()`.
 
+Treat tokens passed to `add()` as immutable route definitions. Adding more routes remains supported,
+including after matching has started or `prepare()` has been called.
+
 ## Route patterns
 
 | Pattern             | Matches                   | Parameters                        |
@@ -115,6 +118,22 @@ routes.match('/about')
 Specificity is compared segment by segment from left to right. Static segments rank above required
 parameters, followed by optional parameters and wildcards. Longer patterns win when their shared
 segments have equal specificity. Registration order breaks remaining ties.
+
+## Preparing static lookups
+
+Call `prepare()` after registering routes to move static lookup preparation to application startup.
+It preserves route precedence and does not execute matchers or casts.
+
+```ts
+routes.add(parseRoute('/about'), 'about')
+routes.add(parseRoute('/health'), 'health')
+routes.prepare()
+```
+
+Preparation is optional. Without it, each static pathname is prepared on its first lookup. It does
+not freeze the table: later additions remain supported, and affected shortcuts are recomputed by
+the next lookup or another `prepare()` call. Preparation does not guarantee warmed-up matching
+performance and does not change steady-state matching speed.
 
 ## Parameter decoding
 
